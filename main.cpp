@@ -172,11 +172,6 @@ int main(int argc, char** argv) {
 	memset(ir_img_left, 0, cDepthH*cDepthW);
 	memset(ir_img_right, 0, cDepthH*cDepthW);
 
-	if (rs_state.ctx != NULL) {
-		fprintf(stderr, "create_context called, but context exists\n");
-		return clean_exit(1, &rs_state);
-	}
-
 	fprintf(stderr, "creating context\n");
 
 	rs_state.ctx = rs2_create_context(RS2_API_VERSION, &e);
