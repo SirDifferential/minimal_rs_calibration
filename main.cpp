@@ -389,11 +389,11 @@ int main(int argc, char** argv) {
 
 		if (got_ir_frames == 2) {
 
-			int64_t timestamp_us = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+			int64_t timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
 			fprintf(stderr, "got 2 ir frames for calibration\n");
 			if (!dyncal.IsGridFull()) {
-				int err = dyncal.AddImages(ir_img_left, ir_img_right, depthbuf, timestamp_us/1000);
+				int err = dyncal.AddImages(ir_img_left, ir_img_right, depthbuf, timestamp_ms);
 				switch (err) {
 				case DC_SUCCESS: break;
 				case DC_ERROR_RECT_INVALID_IMAGES:
