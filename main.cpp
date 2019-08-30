@@ -1,16 +1,28 @@
-#include <stdio.h>
-#include <stdlib.h>
+﻿/**
+ * Minimal C++ program that utilizes Realsense D400 devices and streams their
+ * depth and color streams. This program also enables a visual preset mode which
+ * can be useful to make sure the installed librealsense SDK, kernel and libraries
+ * work properly as the advanced mode seems to be a feature that fails to work
+ * properly on some systems.
+ *
+ * To keep the code smaller and capable of running on minimal systems, no GUI
+ * is used at all.
+ */
+
+#include <iostream>
 #include <string.h>
 #include <stdint.h>
-#include <vector>
 #include <chrono>
+#include <list>
 
-#include <librealsense2/rs.h>
-#include <librealsense2/rs_advanced_mode.h>
-#include <librealsense2/h/rs_pipeline.h>
-#include <librealsense2/h/rs_option.h>
-#include <librealsense2/h/rs_frame.h>
-#include <librealsense2/rsutil.h>
+#ifdef WIN32
+#include <Windows.h>
+#else
+#include <csignal>
+#endif
+
+#include <librealsense2/rs.hpp>
+#include <librealsense2/rs_advanced_mode.hpp>
 
 #include <librscalibrationapi/DSCalData.h>
 #include <librscalibrationapi/DSDynamicCalibration.h>
@@ -18,426 +30,384 @@
 #include <librscalibrationapi/DSShared.h>
 #include <librscalibrationapi/rs2-custom-calibration-mm.h>
 
-const int cDepthW = 1280;
-const int cDepthH = 720;
-const int cColorW = 1920;
-const int cColorH = 1080;
-uint16_t* depthbuf = NULL;
-uint8_t* ir_img_left = NULL;
-uint8_t* ir_img_right = NULL;
+#define PRESET_COUNT 3
+const char* presets[PRESET_COUNT] = {
+    "High Accuracy",
+    "High Density",
+    "Hand"
+};
 
-class ReleaseLater
-{
+bool got_sigint = false;
+const int color_w = 1920;
+const int color_h = 1080;
+const int depth_w = 1280;
+const int depth_h = 720;
+
+/**
+ * Wrapper to call delete or delete[] on dtor
+ */
+template <class T>
+class DeleteLater {
 public:
-	ReleaseLater() {
-		frames = NULL;
-	}
+    DeleteLater(T* p, bool is_arr, std::string n) {
+        m_p = p;
+        m_arr = is_arr;
+        m_name = n;
+    }
 
-	virtual ~ReleaseLater() {
-		for (auto& f : to_release)
-			rs2_release_frame(f);
-		if (frames != NULL)
-			rs2_release_frame(frames);
-	}
-	std::vector<rs2_frame*> to_release;
-	rs2_frame* frames;
+    virtual ~DeleteLater() {
+        if (!m_p)
+            return;
+
+        std::cout << "freeing memory: " << m_name << std::endl;
+
+        if (m_arr) {
+            delete[] m_p;
+        } else {
+            delete m_p;
+        }
+    }
+
+    T* m_p;
+    bool m_arr;
+    std::string m_name;
 };
 
-#define RS_STATE_SENSORS_MAX 20
-struct RS_State
-{
-	rs2_context* ctx;
-	rs2_device_list* device_list;
-	int32_t dev_count;
-	rs2_device* dev;
-	rs2_sensor_list* sensor_list;
-	rs2_sensor* sensors[RS_STATE_SENSORS_MAX];
-	int32_t sensors_created;
-	int32_t sensor_list_count;
-	int32_t advanced_enabled;
-	rs2_pipeline* pipe;
-	rs2_pipeline_profile* selection;
-	rs2_pipeline_profile* started_pipeline;
-	rs2_stream_profile_list* stream_list;
-	int32_t stream_list_count;
-	rs2_config* config;
-	rs2_processing_block* temporal_filter;
-	rs2_frame_queue* frame_queue;
-};
-
-int8_t check_error(rs2_error* e)
-{
-	if (e)
-	{
-		fprintf(stderr, "rs_error was raised when calling %s(%s): \n",
-			   rs2_get_failed_function(e), rs2_get_failed_args(e));
-		fprintf(stderr, "%s\n", rs2_get_error_message(e));
-		return 1;
-	}
-	return 0;
+void stop(rs2::pipeline& p) {
+    p.stop();
 }
 
-int8_t clear_state(struct RS_State* s)
+#ifdef WIN32
+bool sigint_handler(DWORD fdwCtrlType) {
+    if(fdwCtrlType == CTRL_C_EVENT) {
+        std::cout << "signal caught: " << fdwCtrlType<< std::endl;
+        got_sigint = true;
+        return true;
+    }
+
+    return false;
+}
+#else
+void sigint_handler(int sig)
 {
-    if (s == NULL) {
-        fprintf(stderr, "Cannot clear state: given pointer is null\n");
+    std::cout << "signal caught: " << sig << std::endl;
+    got_sigint = true;
+}
+#endif
+
+int main() try {
+
+    // register signal handlers
+#ifdef WIN32
+    SetConsoleCtrlHandler( (PHANDLER_ROUTINE) sigint_handler, TRUE );
+#else
+    signal(SIGINT, sigint_handler);
+#endif
+
+    const char* desired_preset = presets[0];
+    size_t preset_strlen = strnlen(desired_preset, 15);
+
+    // allocate buffers for reading color and depth frames
+    unsigned char* colorbuf = new unsigned char[color_w * color_h * 3];
+    unsigned char* irbuf_l = new unsigned char[depth_w * depth_h];
+    unsigned char* irbuf_r = new unsigned char[depth_w * depth_h];
+    uint16_t* depthbuf = new uint16_t[depth_w * depth_h];
+
+    if (depthbuf == NULL || colorbuf == NULL || irbuf_l == NULL || irbuf_r == NULL) {
+        std::cout << "failed allocating memory" << std::endl;
         return 1;
     }
 
-    if(s->temporal_filter) {
-        rs2_delete_processing_block(s->temporal_filter);
+    DeleteLater<unsigned char> del1(colorbuf, true, "colorbuffer");
+    DeleteLater<uint16_t> del2(depthbuf, true, "depthbuffer");
+    DeleteLater<unsigned char> del3(irbuf_l, true, "irbuf_l");
+    DeleteLater<unsigned char> del4(irbuf_r, true, "irbuf_r");
+
+    memset(colorbuf, 0, color_w*color_h*3);
+    memset(depthbuf, 0, depth_w*depth_h*sizeof(uint16_t));
+    memset(irbuf_l, 0, depth_w*depth_h);
+    memset(irbuf_r, 0, depth_w*depth_h);
+
+    std::cout << "Allocated memory" << std::endl;
+
+    rs2::context context;
+
+    // Create a Pipeline - this serves as a top-level API for streaming and processing frames
+    rs2::pipeline pipeline(context);
+    std::shared_ptr<rs2_pipeline> p_pipeline = std::shared_ptr<rs2_pipeline>(pipeline);
+
+    std::cout << "Created pipeline" << std::endl;
+
+    rs2::device_list devs = context.query_devices();
+    if (devs.size() != 1) {
+        std::cout << "Expecting to find one device connected to the computer" << std::endl;
+        return 1;
     }
 
-    if (s->frame_queue) {
-        rs2_delete_frame_queue(s->frame_queue);
+    rs2::device dev = devs[0];
+    const char* serial = dev.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER);
+    std::cout << "Using camera: " << serial << std::endl;
+
+    std::vector<rs2::sensor> sensors = dev.query_sensors();
+    std::cout << "Device has " << sensors.size() << " sensors" << std::endl;
+
+    DynamicCalibrationAPI::DSDynamicCalibration dyncal;
+    int retcode = dyncal.Initialize((void*)&dev,
+        DynamicCalibrationAPI::DSDynamicCalibration::CAL_MODE_INTEL_TARGETLESS,
+        depth_w, depth_h, true);
+
+    switch (retcode) {
+    case DC_SUCCESS:
+        fprintf(stderr, "dyncal initialized successfully\n");
+        break;
+    case DC_ERROR_INVALID_PARAMETER:
+        fprintf(stderr, "dyncal initialize DC_ERROR_INVALID_PARAMETER\n");
+        return 1;
+    case DC_ERROR_RESOLUTION_NOT_SUPPORTED_V2:
+        fprintf(stderr, "dyncal initialize DC_ERROR_RESOLUTION_NOT_SUPPORTED_V2\n");
+        return 1;
+    case DC_ERROR_TABLE_NOT_SUPPORTED:
+        fprintf(stderr, "dyncal initialize DC_ERROR_TABLE_NOT_SUPPORTED\n");
+        return 1;
+    case DC_ERROR_TABLE_NOT_VALID_RESOLUTION:
+        fprintf(stderr, "dyncal initialize DC_ERROR_TABLE_NOT_VALID_RESOLUTION\n");
+        return 1;
     }
 
-    if (s->dev) {
-        rs2_delete_device(s->dev);
+    rs400::advanced_mode adv(dev);
+    if (!adv.is_enabled()) {
+        std::cout << "advanced mode is not enabled -> enabling it" << std::endl;
+
+        adv.toggle_advanced_mode(true);
+        std::cout << "Finished toggling advanced mode" << std::endl;
+    } else {
+        std::cout << "advanced mode is already enabled" << std::endl;
     }
 
-    int32_t sen;
-    for (sen = 0; sen < s->sensors_created; sen++) {
-        rs2_delete_sensor(s->sensors[sen]);
+    // Enable desired preset
+    bool enabled_preset = false;
+    std::cout << "Enabling preset " << desired_preset << std::endl;
+
+    for (auto&& s : sensors) {
+        if (s.supports(RS2_OPTION_VISUAL_PRESET)) {
+
+            // See if the preset is already in use
+            float pres = s.get_option(RS2_OPTION_VISUAL_PRESET);
+            const char* cur_desc = s.get_option_value_description(RS2_OPTION_VISUAL_PRESET, pres);
+            if (strncmp(cur_desc, desired_preset, preset_strlen) == 0) {
+                std::cout << "already using desired preset" << std::endl;
+                enabled_preset = true;
+                break;
+            }
+
+            rs2::option_range r = s.get_option_range(RS2_OPTION_VISUAL_PRESET);
+
+            // Go through all available presets and find the proper index to enable
+            for (int i = (int)r.min; i < (int)r.max; ++i) {
+                const char* desc = s.get_option_value_description(RS2_OPTION_VISUAL_PRESET, i);
+                if (strncmp(desc, desired_preset, preset_strlen) == 0) {
+                    s.set_option(RS2_OPTION_VISUAL_PRESET, i);
+                    enabled_preset = true;
+                    std::cout << "Enabled desired preset" << std::endl;
+                    break;
+                }
+            }
+
+            break;
+        }
     }
 
-    if (s->sensor_list) {
-        rs2_delete_sensor_list(s->sensor_list);
+    if (enabled_preset == false) {
+        std::cout << "Did not find sensor that supports visual preset option" << std::endl;
+        return 1;
     }
 
-    if (s->device_list) {
-        rs2_delete_device_list(s->device_list);
+    // Enable max resolution streams
+    rs2::config conf;
+
+    conf.enable_device(serial);
+    conf.enable_stream(RS2_STREAM_DEPTH, -1, depth_w, depth_h, RS2_FORMAT_Z16, 30);
+    conf.enable_stream(RS2_STREAM_COLOR, -1, color_w, color_h, RS2_FORMAT_RGB8, 30);
+    conf.enable_stream(RS2_STREAM_INFRARED, 1, depth_w, depth_h, RS2_FORMAT_Y8, 30);
+    conf.enable_stream(RS2_STREAM_INFRARED, 2, depth_w, depth_h, RS2_FORMAT_Y8, 30);
+
+    std::cout << "streams enabled" << std::endl;
+
+    // Configure and start the pipeline
+    rs2::pipeline_profile prof = pipeline.start(conf);
+    std::cout << "pipeline started" << std::endl;
+
+    float d_width, d_height;
+    float c_width, c_height;
+    uint64_t frames_got = 0;
+
+    std::cout << "entering main loop" << std::endl;
+
+    std::list<int> ftimes;
+    int dur_sum = 0;
+
+    while (true)
+    {
+        std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
+
+        if (got_sigint) {
+            break;
+        }
+        // Block program until frames arrive
+        rs2::frameset frames = pipeline.wait_for_frames(3000);
+
+        bool got_depth = false;
+        bool got_color = false;
+        bool got_ir_left = false;
+        bool got_ir_right = false;
+        int ir_index = 0;
+
+        // get specific frame instances
+        for (auto&& f : frames) {
+            if (f.is<rs2::depth_frame>()) {
+                rs2::depth_frame dframe = f.as<rs2::depth_frame>();
+                d_width = dframe.get_width();
+                d_height = dframe.get_height();
+
+                if (d_width != depth_w || d_height != depth_h) {
+
+                    std::cout << "Invalid depth frame resolution: "
+                        << d_width << ", " << d_height << std::endl;
+
+                    stop(pipeline);
+                    return 1;
+                }
+
+                uint16_t* depthdata = (uint16_t*)dframe.get_data();
+                memcpy(depthbuf, depthdata, depth_w * depth_h * sizeof(uint16_t));
+                got_depth = true;
+
+            } else if (f.template is<rs2::video_frame>()) {
+                rs2::video_frame cframe = f.template as<rs2::video_frame>();
+                c_width = cframe.get_width();
+                c_height = cframe.get_height();
+
+                // IR frames are sized the same as depth frames
+                if (c_width == d_width) {
+                    unsigned char* irdata = (unsigned char*)cframe.get_data();
+                    if (ir_index == 0) {
+                        memcpy(irbuf_l, irdata, depth_h * depth_w);
+                        got_ir_left = true;
+                    } else {
+                        memcpy(irbuf_r, irdata, depth_h * depth_w);
+                        got_ir_right = true;
+                    }
+
+                    ir_index++;
+                } else {
+                    if (c_width != color_w || c_height != color_h) {
+                        std::cout << "Invalid color frame resolution: "
+                            << c_width << ", " << c_height << std::endl;
+                        stop(pipeline);
+                        return 1;
+                    }
+
+                    unsigned char* colordata = (unsigned char*)cframe.get_data();
+                    memcpy(colorbuf, colordata, color_w * color_h * 3);
+                    got_color = true;
+                }
+            }
+        }
+
+        if (!got_color || !got_depth || !got_ir_left || !got_ir_right) {
+            std::cout << "Did not get all frame types" << std::endl;
+            break;
+        }
+
+        frames_got++;
+        int64_t timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>
+            (std::chrono::system_clock::now().time_since_epoch()).count();
+
+
+        if (!dyncal.IsGridFull()) {
+            int err = dyncal.AddImages(irbuf_l, irbuf_r, depthbuf, timestamp_ms);
+            switch (err) {
+            case DC_SUCCESS: break;
+            case DC_ERROR_RECT_INVALID_IMAGES:
+                std::cout << "DC_ERROR_RECT_INVALID_IMAGES" << std::endl;
+                break;
+            case DC_ERROR_RECT_INVALID_GRID_FILL:
+                std::cout << "DC_ERROR_RECT_INVALID_GRID_FILL" << std::endl;
+                break;
+            case DC_ERROR_RECT_TOO_SIMILAR:
+                std::cout << "DC_ERROR_RECT_TOO_SIMILAR" << std::endl;
+                break;
+            case DC_ERROR_RECT_TOO_MUCH_FEATURES:
+                std::cout << "DC_ERROR_RECT_TOO_MUCH_FEATURES" << std::endl;
+                break;
+            case DC_ERROR_RECT_NO_FEATURES:
+                std::cout << "DC_ERROR_RECT_NO_FEATURES" << std::endl;
+                break;
+            case DC_ERROR_RECT_GRID_FULL:
+                std::cout << "DC_ERROR_RECT_GRID_FULL" << std::endl;
+                break;
+            case DC_ERROR_UNKNOWN:
+                std::cout << "DC_ERROR_UNKNOWN" << std::endl;
+                break;
+            }
+        }
+        else {
+            std::cout << "Writing calibration tables" << std::endl;
+            int err = dyncal.UpdateCalibrationTables();
+            switch (err) {
+            case DC_ERROR_FAIL:
+                std::cout << "Error writing calibration into the device" << std::endl;
+                break;
+            case DC_SUCCESS:
+                std::cout << "Successfully wrote calibration into the device" << std::endl;
+                break;
+            }
+
+            stop(pipeline);
+            return 1;
+        }
+
+        // calculate frame time
+        std::chrono::high_resolution_clock::time_point t2 = std::chrono::high_resolution_clock::now();
+        auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+        if (dur == 0) {
+            dur = 1;
+        }
+
+        // calculate average fps
+        ftimes.push_back(dur);
+
+        if (ftimes.size() > 100) {
+            dur_sum -= ftimes.front();
+            ftimes.pop_front();
+        }
+
+        dur_sum += dur;
+        int avg_dur = dur_sum / ftimes.size();
+
+        if (dur_sum == 0) {
+            dur_sum = 1;
+        }
+
+        int avg_fps = 1000 / avg_dur;
+
+        std::cout << "Finished frame " << frames_got << " in " << dur
+            << " milliseconds (" << avg_fps << " fps)" << std::endl;
     }
 
-    if (s->config) {
-        rs2_delete_config(s->config);
-    }
+    std::cout << "exited main loop" << std::endl;
 
-    if (s->stream_list) {
-        rs2_delete_stream_profiles_list(s->stream_list);
-    }
+    stop(pipeline);
+    std::cout << "pipeline stopped" << std::endl;
 
-    if (s->selection) {
-        rs2_delete_pipeline_profile(s->selection);
-    }
-
-    if (s->started_pipeline) {
-        rs2_delete_pipeline_profile(s->started_pipeline);
-    }
-
-    if (s->pipe) {
-        rs2_pipeline_stop(s->pipe, NULL);
-        rs2_delete_pipeline(s->pipe);
-    }
-
-    if (s->ctx) {
-        rs2_delete_context(s->ctx);
-    }
-
-    memset(s, 0, sizeof(struct RS_State));
     return 0;
 }
-
-int clean_exit(int exitcode, struct RS_State* s) {
-	delete[] depthbuf;
-	delete[] ir_img_left;
-	delete[] ir_img_right;
-	depthbuf = NULL;
-	ir_img_left = NULL;
-	ir_img_right = NULL;
-
-	clear_state(s);
-	fprintf(stderr, "Exiting with exit code: %d\n", exitcode);
-	return exitcode;
+catch (const rs2::error & e) {
+    std::cerr << "RealSense error calling " << e.get_failed_function()
+        << "(" << e.get_failed_args() << "):\n    " << e.what() << std::endl;
+    return 1;
 }
-
-int main(int argc, char** argv) {
-	rs2_error* e = NULL;
-
-	struct RS_State rs_state;
-	memset(&rs_state, 0, sizeof(rs_state));
-
-	DynamicCalibrationAPI::DSDynamicCalibration dyncal;
-
-	depthbuf = new uint16_t[cDepthH*cDepthW];
-	ir_img_left = new uint8_t[cDepthH*cDepthW];
-	ir_img_right = new uint8_t[cDepthH*cDepthW];
-
-	if (depthbuf == NULL || ir_img_left == NULL || ir_img_right == NULL) {
-		fprintf(stderr, "failed allocating memory\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	memset(depthbuf, 0, cDepthH*cDepthW*sizeof(uint16_t));
-	memset(ir_img_left, 0, cDepthH*cDepthW);
-	memset(ir_img_right, 0, cDepthH*cDepthW);
-
-	fprintf(stderr, "creating context\n");
-
-	rs_state.ctx = rs2_create_context(RS2_API_VERSION, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed creating rs context\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	fprintf(stderr, "context created\n");
-
-	rs_state.device_list = rs2_query_devices(rs_state.ctx, &e);
-	if (check_error(e) != 0) {
-		return clean_exit(1, &rs_state);
-	}
-
-	rs_state.dev_count = rs2_get_device_count(rs_state.device_list, &e);
-	if (check_error(e) != 0) {
-		return clean_exit(1, &rs_state);
-	}
-
-	fprintf(stderr, "There are %d connected RealSense devices.\n", rs_state.dev_count);
-	if (0 == rs_state.dev_count) {
-		return clean_exit(1, &rs_state);
-	}
-
-	fprintf(stderr, "Creating device\n");
-	rs_state.dev = rs2_create_device(rs_state.device_list, 0, &e);
-	if (check_error(e) != 0) {
-		return clean_exit(1, &rs_state);
-	}
-
-	rs_state.pipe = rs2_create_pipeline(rs_state.ctx, &e);
-	if (check_error(e) != 0) {
-		return clean_exit(1, &rs_state);
-	}
-
-	rs_state.config = rs2_create_config(&e);
-	if (check_error(e) != 0) {
-		return clean_exit(1, &rs_state);
-	}
-
-	rs2_config_enable_stream(rs_state.config, RS2_STREAM_DEPTH, -1, cDepthW, cDepthH, RS2_FORMAT_Z16, 30, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed initting depth streaming\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	fprintf(stderr, "Depth stream created: %d x %d at %d FPS\n", cDepthW, cDepthH, 30);
-
-	rs2_config_enable_stream(rs_state.config, RS2_STREAM_COLOR, -1, cColorW, cColorH, RS2_FORMAT_RGB8, 30, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed initting color streaming\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	fprintf(stderr, "Color stream created: %d x %d at %d FPS\n", cColorW, cColorH, 30);
-
-	rs2_config_enable_stream(rs_state.config, RS2_STREAM_INFRARED, 1, cDepthW, cDepthH, RS2_FORMAT_Y8, 30, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed initting ir 1 streaming\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	rs2_config_enable_stream(rs_state.config, RS2_STREAM_INFRARED, 2, cDepthW, cDepthH, RS2_FORMAT_Y8, 30, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed initting ir 2 streaming\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	rs_state.selection = rs2_config_resolve(rs_state.config, rs_state.pipe, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed resolving config\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	rs_state.dev = rs2_pipeline_profile_get_device(rs_state.selection, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed getting device for pipeline profile\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	rs_state.sensor_list = rs2_query_sensors(rs_state.dev, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed querying for sensors\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	rs_state.sensor_list_count = rs2_get_sensors_count(rs_state.sensor_list, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed getting sensor list count\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	int sensor;
-	for (sensor = 0; sensor < rs_state.sensor_list_count; sensor++) {
-		rs_state.sensors[sensor] = rs2_create_sensor(rs_state.sensor_list, sensor, &e);
-		if (check_error(e) != 0) {
-			fprintf(stderr, "Failed creating sensor %d / %d\n", sensor, rs_state.sensor_list_count);
-			return clean_exit(1, &rs_state);
-		}
-
-		rs_state.sensors_created++;
-	}
-
-	rs_state.stream_list = rs2_pipeline_profile_get_streams(rs_state.selection, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed getting pipeline profile streams\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	rs_state.stream_list_count = rs2_get_stream_profiles_count(rs_state.stream_list, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed getting pipeline profile stream count\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	rs_state.started_pipeline = rs2_pipeline_start_with_config(rs_state.pipe, rs_state.config, &e);
-	if (check_error(e) != 0) {
-		fprintf(stderr, "Failed starting pipeline\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	fprintf(stderr, "pipeline started\n");
-
-	int retcode = dyncal.Initialize(rs_state.dev,
-		DynamicCalibrationAPI::DSDynamicCalibration::CAL_MODE_INTEL_TARGETLESS,
-		cDepthW, cDepthH, true);
-
-	switch (retcode) {
-	case DC_SUCCESS:
-		fprintf(stderr, "dyncal initialized successfully\n");
-		break;
-	case DC_ERROR_INVALID_PARAMETER:
-		fprintf(stderr, "dyncal initialize DC_ERROR_INVALID_PARAMETER\n");
-		return clean_exit(1, &rs_state);
-	case DC_ERROR_RESOLUTION_NOT_SUPPORTED_V2:
-		fprintf(stderr, "dyncal initialize DC_ERROR_RESOLUTION_NOT_SUPPORTED_V2\n");
-		return clean_exit(1, &rs_state);
-	case DC_ERROR_TABLE_NOT_SUPPORTED:
-		fprintf(stderr, "dyncal initialize DC_ERROR_TABLE_NOT_SUPPORTED\n");
-		return clean_exit(1, &rs_state);
-	case DC_ERROR_TABLE_NOT_VALID_RESOLUTION:
-		fprintf(stderr, "dyncal initialize DC_ERROR_TABLE_NOT_VALID_RESOLUTION\n");
-		return clean_exit(1, &rs_state);
-	}
-
-	while (true) {
-		rs2_frame* frames = NULL;
-		ReleaseLater releaseLater;
-		releaseLater.frames = frames;
-		int got_ir_frames = 0;
-
-		frames = rs2_pipeline_wait_for_frames(rs_state.pipe, 30000, &e);
-		if (check_error(e) != 0) {
-			fprintf(stderr, "Failed waiting for frames\n");
-			return clean_exit(1, &rs_state);
-		}
-
-		int num_frames = rs2_embedded_frames_count(frames, &e);
-		if (check_error(e) != 0) {
-			fprintf(stderr, "Failed getting framelist size\n");
-			return clean_exit(1, &rs_state);
-		}
-
-		for (int f = 0; f < num_frames; f++)
-		{
-			rs2_frame* fr = rs2_extract_frame(frames, f, &e);
-			if (check_error(e) != 0) {
-				fprintf(stderr, "Failed extracting frame %d / %d\n", f, num_frames);
-				return clean_exit(1, &rs_state);
-			}
-
-			releaseLater.to_release.push_back(fr);
-
-			if (rs2_is_frame_extendable_to(fr, RS2_EXTENSION_DEPTH_FRAME, &e) == 1)
-			{
-				releaseLater.to_release.push_back(fr);
-
-				if (check_error(e) != 0) {
-					fprintf(stderr, "Failed waiting for frame after frame queue\n");
-					return clean_exit(1, &rs_state);
-				}
-
-				uint16_t* dbuf = (uint16_t*)(rs2_get_frame_data(fr, &e));
-				if (check_error(e) != 0) {
-					fprintf(stderr, "Failed getting depth frame\n");
-					return clean_exit(1, &rs_state);
-				}
-
-				memcpy(depthbuf, dbuf, cDepthW*cDepthH*sizeof(uint16_t));
-			} else if (rs2_is_frame_extendable_to(fr, RS2_EXTENSION_VIDEO_FRAME, &e) == 1) {
-				int fheight = rs2_get_frame_height(fr, &e);
-				if (check_error(e) != 0) {
-					fprintf(stderr, "Failed getting color frame\n");
-					return clean_exit(1, &rs_state);
-				}
-
-				// Color and IR frames can be told apart by their resolution
-				if (fheight == cDepthH) {
-
-					uint8_t* data = (uint8_t*)rs2_get_frame_data(fr, &e);
-					if (f == 2) {
-						memcpy(ir_img_left, data, cDepthW*cDepthH);
-					} else {
-						memcpy(ir_img_right, data, cDepthW*cDepthH);
-					}
-
-					got_ir_frames++;
-				} else {
-					// color not used in this example
-				}
-
-			}
-		}
-
-		if (got_ir_frames == 2) {
-
-			int64_t timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-
-			fprintf(stderr, "got 2 ir frames for calibration\n");
-			if (!dyncal.IsGridFull()) {
-				int err = dyncal.AddImages(ir_img_left, ir_img_right, depthbuf, timestamp_ms);
-				switch (err) {
-				case DC_SUCCESS: break;
-				case DC_ERROR_RECT_INVALID_IMAGES:
-					fprintf(stderr, "DC_ERROR_RECT_INVALID_IMAGES\n");
-					break;
-				case DC_ERROR_RECT_INVALID_GRID_FILL:
-					fprintf(stderr, "DC_ERROR_RECT_INVALID_GRID_FILL\n");
-					break;
-				case DC_ERROR_RECT_TOO_SIMILAR:
-					fprintf(stderr, "DC_ERROR_RECT_TOO_SIMILAR\n");
-					break;
-				case DC_ERROR_RECT_TOO_MUCH_FEATURES:
-					fprintf(stderr, "DC_ERROR_RECT_TOO_MUCH_FEATURES\n");
-					break;
-				case DC_ERROR_RECT_NO_FEATURES:
-					fprintf(stderr, "DC_ERROR_RECT_NO_FEATURES\n");
-					break;
-				case DC_ERROR_RECT_GRID_FULL:
-					fprintf(stderr, "DC_ERROR_RECT_GRID_FULL\n");
-					break;
-				case DC_ERROR_UNKNOWN:
-					fprintf(stderr, "DC_ERROR_UNKNOWN\n");
-					break;
-				}
-			}
-			else {
-				fprintf(stderr, "Writing calibration tables\n");
-				int err = dyncal.UpdateCalibrationTables();
-				switch (err) {
-				case DC_ERROR_FAIL:
-					fprintf(stderr, "Error writing calibration into the device\n");
-					break;
-				case DC_SUCCESS:
-					fprintf(stderr, "Successfully wrote calibration into the device\n");
-					break;
-				}
-
-				return clean_exit(0, &rs_state);
-			}
-		} else {
-			fprintf(stderr, "got invalid number of	ir frames for calibration: %d\n", got_ir_frames);
-		}
-	}
-
-	return clean_exit(0, &rs_state);
+catch (const std::exception& e) {
+    std::cerr << "Unspecified exception: " << e.what() << std::endl;
+    return 1;
 }
-

@@ -1,1 +1,3 @@
-a.out
+./minimal_rs_calibration
+*.o
+*.swp
