@@ -5,6 +5,6 @@ This code can be used to debug the Intel Realsense D4XX target-less calibration 
 ### Building
 
 * Edit `Makefile` and `run.sh`
-* Make sure you are using only one version of librealsense - currently (2018.08.30) librscalibrationapi bundles its own version of librealsense which might conflict with your locally available copy
+* Make sure you are using only one version of librealsense - currently (2019.08.30) librscalibrationapi bundles its own version of librealsense which might conflict with your locally available copy
 * `make`
 * sh run.sh
