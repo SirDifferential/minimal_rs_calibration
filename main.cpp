@@ -1,15 +1,4 @@
-﻿/**
- * Minimal C++ program that utilizes Realsense D400 devices and streams their
- * depth and color streams. This program also enables a visual preset mode which
- * can be useful to make sure the installed librealsense SDK, kernel and libraries
- * work properly as the advanced mode seems to be a feature that fails to work
- * properly on some systems.
- *
- * To keep the code smaller and capable of running on minimal systems, no GUI
- * is used at all.
- */
-
-#include <iostream>
+﻿#include <iostream>
 #include <string.h>
 #include <stdint.h>
 #include <chrono>
