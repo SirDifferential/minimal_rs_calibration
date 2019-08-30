@@ -2,5 +2,9 @@
 
 This code can be used to debug the Intel Realsense D4XX target-less calibration as specified by the librscalibration api: https://www.intel.com/content/dam/support/us/en/documents/emerging-technologies/intel-realsense-technology/RealSense_D400_Dyn_Calib_Programmer.pdf
 
-To build, do something comparable to `g++ main.cpp -I/home/gekko/librealsense/include -I/home/gekko/librscalibrationapi/include -L/home/gekko/librealsense/build -lrealsense2 -L/home/gekko/librscalibrationapi/lib -lDSDynamicCalibrationAPI`
+### Building
 
+* Edit `Makefile` and `run.sh`
+* Make sure you are using only one version of librealsense - currently (2018.08.30) librscalibrationapi bundles its own version of librealsense which might conflict with your locally available copy
+* `make`
+* sh run.sh
