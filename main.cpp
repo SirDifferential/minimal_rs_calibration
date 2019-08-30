@@ -19,6 +19,16 @@
 #include <librscalibrationapi/DSShared.h>
 #include <librscalibrationapi/rs2-custom-calibration-mm.h>
 
+// To build with a graphical window
+#ifdef WITH_GUI
+#define SDL_MAIN_HANDLED
+#ifdef WIN32
+#include <SDL.h>
+#else
+#include <SDL2/SDL.h>
+#endif
+#endif
+
 #define PRESET_COUNT 3
 const char* presets[PRESET_COUNT] = {
     "High Accuracy",
@@ -62,6 +72,44 @@ public:
     std::string m_name;
 };
 
+#ifdef WITH_GUI
+class SDLCloser {
+public:
+    SDLCloser() {
+        sdlwin = NULL;
+        sdlren = NULL;
+        drawsurf = NULL;
+        tex = NULL;
+    }
+
+    virtual ~SDLCloser() {
+
+        if (tex) {
+            SDL_DestroyTexture(tex);
+        }
+
+        if (drawsurf) {
+            SDL_FreeSurface(drawsurf);
+        }
+
+        if (sdlren) {
+            SDL_DestroyRenderer(sdlren);
+        }
+
+        if (sdlwin) {
+            SDL_DestroyWindow(sdlwin);
+        }
+        SDL_Quit();
+    }
+
+    SDL_Window* sdlwin;
+    SDL_Renderer* sdlren;
+    SDL_Surface* drawsurf;
+    SDL_Texture* tex;
+};
+
+#endif
+
 void stop(rs2::pipeline& p) {
     p.stop();
 }
@@ -101,6 +149,7 @@ int main() try {
     unsigned char* irbuf_l = new unsigned char[depth_w * depth_h];
     unsigned char* irbuf_r = new unsigned char[depth_w * depth_h];
     uint16_t* depthbuf = new uint16_t[depth_w * depth_h];
+    unsigned char* drawbuffer = new unsigned char[depth_w * depth_h * 4];
 
     if (depthbuf == NULL || colorbuf == NULL || irbuf_l == NULL || irbuf_r == NULL) {
         std::cout << "failed allocating memory" << std::endl;
@@ -111,13 +160,79 @@ int main() try {
     DeleteLater<uint16_t> del2(depthbuf, true, "depthbuffer");
     DeleteLater<unsigned char> del3(irbuf_l, true, "irbuf_l");
     DeleteLater<unsigned char> del4(irbuf_r, true, "irbuf_r");
+    DeleteLater<unsigned char> del5(drawbuffer, true, "drawbuffer");
 
     memset(colorbuf, 0, color_w*color_h*3);
     memset(depthbuf, 0, depth_w*depth_h*sizeof(uint16_t));
     memset(irbuf_l, 0, depth_w*depth_h);
     memset(irbuf_r, 0, depth_w*depth_h);
+    memset(drawbuffer, 0, depth_w*depth_h*4);
 
     std::cout << "Allocated memory" << std::endl;
+
+#ifdef WITH_GUI
+
+    SDLCloser sdlcloser;
+    SDL_SetMainReady();
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        std::cout << "Failed initting SDLL: " << SDL_GetError() << std::endl;
+        return 1;
+    }
+
+    SDL_Window* sdlwin = SDL_CreateWindow("rs2", 510, 510, depth_w, depth_h, SDL_WINDOW_SHOWN);
+    if (sdlwin == NULL)
+    {
+        std::cout << "failed creating SDL window" << std::endl;
+        SDL_Quit();
+        return 1;
+    }
+
+    sdlcloser.sdlwin = sdlwin;
+
+    SDL_Renderer* sdlren = SDL_CreateRenderer(sdlwin, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (sdlren == NULL)
+    {
+        std::cout << "Failed creating SDL renderer: " << SDL_GetError() << std::endl,
+        SDL_DestroyWindow(sdlwin);
+        SDL_Quit();
+        return 1;
+    }
+    sdlcloser.sdlren = sdlren;
+
+    SDL_Surface* surf = SDL_CreateRGBSurfaceFrom((void*)drawbuffer, depth_w, depth_h, 32, depth_w*3,
+        0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
+
+    if (surf == NULL) {
+        std::cout << "failed allocating SDL surface" << std::endl;
+        return 1;
+    }
+
+    sdlcloser.drawsurf = surf;
+    SDL_Texture* tex = SDL_CreateTextureFromSurface(sdlren, surf);
+
+    if (tex == NULL)
+    {
+        std::cout << "Failed creating sdl texture: " << SDL_GetError() << std::endl;
+        return 1;
+    }
+
+    sdlcloser.tex = tex;
+
+    uint32_t format;
+    int access;
+    int w;
+    int h;
+
+    if (SDL_QueryTexture(tex, &format, &access, &w, &h) != 0)
+    {
+        fprintf(stderr, "query tex failed: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    // This must be ARGB
+    std::cout << "SDL tex format: " << SDL_GetPixelFormatName(format) << std::endl;
+#endif
 
     rs2::context context;
 
@@ -355,6 +470,29 @@ int main() try {
             stop(pipeline);
             return 1;
         }
+
+#ifdef WITH_GUI
+        unsigned int offset;
+        for (int y = 0; y < depth_h; ++y) {
+            for (int x = 0; x < depth_w; ++x) {
+                offset = 4 * (y * depth_w + x);
+                drawbuffer[offset + 0] = irbuf_l[y * depth_w + x];
+                drawbuffer[offset + 1] = drawbuffer[offset];
+                drawbuffer[offset + 2] = drawbuffer[offset];
+                drawbuffer[offset + 3] = 255;
+            }
+        }
+
+        if (SDL_UpdateTexture(tex, NULL, (void*)drawbuffer, depth_w * 4) != 0) {
+            std::cout << "Failed updating texture: " << SDL_GetError() << std::endl;
+            stop(pipeline);
+            return 1;
+        }
+
+        SDL_RenderClear(sdlren);
+        SDL_RenderCopy(sdlren, tex, NULL, NULL);
+        SDL_RenderPresent(sdlren);
+#endif
 
         // calculate frame time
         std::chrono::high_resolution_clock::time_point t2 = std::chrono::high_resolution_clock::now();

@@ -1,3 +1,4 @@
-./minimal_rs_calibration
+minimal_realsense_calibration
 *.o
 *.swp
+*.pro.user
